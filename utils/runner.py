@@ -4,6 +4,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import torch
 from stable_baselines3 import SAC
 
 from .environment import ExposureEnv
@@ -60,17 +61,26 @@ class WalkForwardRunner:
 
     def run(self, data: pd.DataFrame):
         """Execute tous les entrainements et construit les resultats OOS."""
+        # Le nombre de threads change les resultats : les reductions paralleles de
+        # torch ne somment pas dans le meme ordre. Mesure sur un fold, seed 42 :
+        # sharpe 0.48 a un thread contre 0.49 a deux. Le fixer ici plutot que par
+        # OMP_NUM_THREADS evite que le defaut suive le nombre de coeurs de la machine.
+        torch.set_num_threads(1)
         splits = self._splits(data.index)
         fold_rows, paths = [], []
         portfolio_states = {seed: None for seed in self.seeds}
 
         for fold, (train_start, train_end, test_end) in enumerate(splits):
-            train = data.iloc[train_start : train_end + 1]
+            # Le train s'arrete a train_end exclu. L'inclure donnait a l'agent la
+            # transition dont le rendement se realise le premier jour du test : une
+            # journee de lookahead, et une incoherence avec le scaler qui, lui,
+            # s'arretait deja a train_end exclu.
+            train = data.iloc[train_start:train_end]
+            # Le test garde une ligne de plus que son bloc OOS : elle ne sert qu'a
+            # calculer le rendement du dernier jour, jamais a decider.
             test = data.iloc[train_end : test_end + 1]
             # Ajuste sur les seules lignes ou l'agent decide pendant l'entrainement.
-            scaler = StateScaler().fit(
-                data.iloc[train_start:train_end], self.state_columns
-            )
+            scaler = StateScaler().fit(train, self.state_columns)
             print(
                 f"Fold {fold} | train {data.index[train_start].date()} -> "
                 f"{data.index[train_end - 1].date()} ({train_end - train_start} j) "
@@ -221,9 +231,24 @@ class WalkForwardRunner:
             oos["w_base"] * asset_return - self.cost_rate * turnover
         )
 
-        returns["SPY"] = asset_return.copy()
-        returns["SPY"].iloc[0] -= self.cost_rate
-        return pd.DataFrame(returns)
+        # Achat simple de l'actif sous-jacent, un seul cout d'entree. Le nom reste
+        # neutre : l'instrument est fixe dans le notebook, pas ici.
+        returns["Buy_and_hold"] = asset_return.copy()
+        returns["Buy_and_hold"].iloc[0] -= self.cost_rate
+
+        frame = pd.DataFrame(returns)
+        # Portefeuille equipondere sur les seeds : c'est la courbe tracee en section 5,
+        # qui ne correspondait auparavant a aucune ligne de metrics_. Attention, ce
+        # n'est pas la colonne SAC de _criterion : celle-la moyenne les Sharpes, alors
+        # que ce portefeuille beneficie de la diversification entre seeds et affiche
+        # donc un Sharpe superieur. Les deux sont reportes, ils ne mesurent pas la
+        # meme chose et _criterion reste le critere fixe avant de voir les resultats.
+        frame.insert(
+            0,
+            "SAC_moyen",
+            frame[[f"SAC_seed_{seed}" for seed in self.seeds]].mean(axis=1),
+        )
+        return frame
 
     def _criterion(self):
         """Compare SAC a chaque adversaire, fold par fold, sur le Sharpe OOS."""
@@ -238,13 +263,13 @@ class WalkForwardRunner:
             {
                 "SAC": sharpe[seed_columns].mean(axis=1),
                 "Baseline": sharpe["Baseline"],
-                "SPY": sharpe["SPY"],
+                "Buy_and_hold": sharpe["Buy_and_hold"],
                 "A_moyen": multiplier.mean().groupby("fold").mean(),
                 "A_dispersion": multiplier.std().groupby("fold").mean(),
             }
         )
         table["SAC > Baseline"] = table["SAC"] > table["Baseline"]
-        table["SAC > SPY"] = table["SAC"] > table["SPY"]
+        table["SAC > Buy_and_hold"] = table["SAC"] > table["Buy_and_hold"]
         return table
 
     def _stats(self, returns: pd.DataFrame):

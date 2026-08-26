@@ -8,6 +8,22 @@ import pandas as pd
 class AgentFeatures:
     """Calcule et detient les features de marche de l'agent."""
 
+    # Liste explicite et ordonnee des features du state, dans l'ordre des colonnes
+    # de la matrice F. Elle seule decide de ce que l'agent observe : un attribut
+    # pose sur l'objet n'entre pas dans le state tant qu'il n'est pas nomme ici.
+    # L'inventaire precedent parcourait vars(self), donc un attribut public ajoute
+    # par megarde devenait une feature constante, standardisee en une colonne de
+    # zeros sans qu'aucune erreur ne soit levee.
+    FEATURES = [
+        "momentum_21",
+        "momentum_63",
+        "return_z",
+        "vol_regime",
+        "vol_short_long_ratio",
+        "downside_vol_ratio",
+        "market_drawdown",
+    ]
+
     def __init__(self, vol_window: int = 21, regime_window: int = 252):
         """Memorise les fenetres de l'agent, distinctes de celles de la baseline."""
         self._vol_window = vol_window
@@ -52,15 +68,15 @@ class AgentFeatures:
 
         return self.frame()
 
-    @property
-    def columns(self):
-        """Les features detenues, dans leur ordre de calcul."""
-        return [name for name in vars(self) if not name.startswith("_")]
-
     def frame(self):
-        """Assemble les features detenues en un seul tableau."""
+        """Assemble les features declarees en un seul tableau."""
+        missing = [name for name in self.FEATURES if not hasattr(self, name)]
+        if missing:
+            raise AttributeError(
+                f"features declarees mais non calculees par build() : {missing}"
+            )
         return pd.DataFrame(
-            {name: getattr(self, name) for name in self.columns}
+            {name: getattr(self, name) for name in self.FEATURES}
         )
 
     def _momentum(self, returns: pd.Series, window: int):
