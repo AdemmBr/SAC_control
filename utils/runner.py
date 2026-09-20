@@ -2,12 +2,12 @@
 
 import time
 
-import numpy as np
 import pandas as pd
 import torch
 from stable_baselines3 import SAC
 
 from .environment import ExposureEnv
+from .metrics import PaperMetrics
 from .scaling import StateScaler
 
 
@@ -29,6 +29,7 @@ class WalkForwardRunner:
         a_max: float = 1.0,
         max_exposure: float = 2.0,
         lambda_risk: float = 0.0,
+        baseline_columns: dict[str, str] | None = None,
     ):
         """Memorise les choix du walk-forward et de SAC."""
         self.sac_config = sac_config
@@ -51,12 +52,22 @@ class WalkForwardRunner:
         # Arbitrage rendement / variance, les deux annualises : l'exposition optimale
         # sans cout vaut w* = mu / (2 * lambda_risk * sigma^2). A 0.0, ablation exacte.
         self.lambda_risk = lambda_risk
+        # Strategies de reference supplementaires, nom affiche -> colonne
+        # d'exposition deja calculee dans data. La baseline historique reste
+        # w_base et n'a pas a figurer ici. Chacune est evaluee sur le meme bloc
+        # OOS, avec le meme cout de turnover, et entre dans _criterion.
+        self.baseline_columns = baseline_columns or {}
+        # Source unique du Sharpe, de la volatilite et du drawdown : _stats en
+        # reprend quatre colonnes sous les noms deja employes dans le notebook.
+        self._paper = PaperMetrics()
 
         self.folds_ = None
         self.decisions_ = None
         self.daily_returns_ = None
         self.metrics_ = None
         self.fold_metrics_ = None
+        self.paper_metrics_ = None
+        self.paper_fold_metrics_ = None
         self.criterion_ = None
 
     def run(self, data: pd.DataFrame):
@@ -139,14 +150,14 @@ class WalkForwardRunner:
                 paths.append(path)
                 # Le run est long : ces trois chiffres des maintenant permettent
                 # d'arreter tot une politique figee ou franchement mauvaise. Le Sharpe
-                # est celui du fold pour ce seed, identique a la ligne correspondante
-                # de fold_metrics_ puisqu'il part des memes net_return.
-                net = path["net_return"]
+                # passe par le meme tableau que fold_metrics_, il ne peut donc plus
+                # en diverger si la convention d'annualisation change.
+                sharpe = self._paper.table(path["net_return"])["Sharpe"].iloc[0]
                 print(
                     f"  seed {seed} | {time.perf_counter() - started:.0f} s "
                     f"| A moyen {path['multiplier'].mean():.3f} "
                     f"| dispersion {path['multiplier'].std():.3f} "
-                    f"| sharpe {net.mean() / net.std() * np.sqrt(252):.2f}",
+                    f"| sharpe {sharpe:.2f}",
                     flush=True,
                 )
 
@@ -154,16 +165,15 @@ class WalkForwardRunner:
         self.decisions_ = pd.concat(paths).sort_index()
         self.daily_returns_ = self._returns(data, splits)
         self.metrics_ = self._stats(self.daily_returns_)
+        self.paper_metrics_ = self._paper.table(self.daily_returns_)
 
-        fold_metrics = []
+        fold_metrics, paper_folds = [], []
         for fold, dates in self.folds_.iterrows():
-            stats = self._stats(
-                self.daily_returns_.loc[dates["test_start"] : dates["test_end"]]
-            )
-            stats["fold"] = fold
-            stats["strategy"] = stats.index
-            fold_metrics.append(stats.set_index(["fold", "strategy"]))
+            block = self.daily_returns_.loc[dates["test_start"] : dates["test_end"]]
+            fold_metrics.append(self._indexed(self._stats(block), fold))
+            paper_folds.append(self._indexed(self._paper.table(block), fold))
         self.fold_metrics_ = pd.concat(fold_metrics)
+        self.paper_fold_metrics_ = pd.concat(paper_folds)
         self.criterion_ = self._criterion()
         return self
 
@@ -212,7 +222,7 @@ class WalkForwardRunner:
         data: pd.DataFrame,
         splits: list[tuple[int, int, int]],
     ):
-        """Aligne les rendements OOS des trois strategies comparees."""
+        """Aligne les rendements OOS de toutes les strategies comparees."""
         returns = {
             f"SAC_seed_{seed}": self.decisions_.loc[
                 self.decisions_["seed"] == seed, "net_return"
@@ -225,11 +235,14 @@ class WalkForwardRunner:
         )
         asset_return = data["price"].shift(-1).loc[oos.index] / oos["price"] - 1.0
 
-        turnover = oos["w_base"].diff().abs()
-        turnover.iloc[0] = abs(oos["w_base"].iloc[0])
-        returns["Baseline"] = (
-            oos["w_base"] * asset_return - self.cost_rate * turnover
-        )
+        # La baseline historique et les references ajoutees suivent exactement la
+        # meme convention : rendement du lendemain, turnover contre la veille, et
+        # position initiale a plat, donc premier turnover egal a la position prise.
+        for name, column in self._exposure_columns().items():
+            exposure = oos[column]
+            turnover = exposure.diff().abs()
+            turnover.iloc[0] = abs(exposure.iloc[0])
+            returns[name] = exposure * asset_return - self.cost_rate * turnover
 
         # Achat simple de l'actif sous-jacent, un seul cout d'entree. Le nom reste
         # neutre : l'instrument est fixe dans le notebook, pas ici.
@@ -250,6 +263,14 @@ class WalkForwardRunner:
         )
         return frame
 
+    def _exposure_columns(self):
+        """Nom affiche -> colonne d'exposition, baseline historique en tete."""
+        return {"Baseline": "w_base", **self.baseline_columns}
+
+    def _opponents(self):
+        """Strategies auxquelles SAC est compare, dans l'ordre d'affichage."""
+        return [*self._exposure_columns(), "Buy_and_hold"]
+
     def _criterion(self):
         """Compare SAC a chaque adversaire, fold par fold, sur le Sharpe OOS."""
         sharpe = self.fold_metrics_["sharpe_0pct"].unstack("strategy")
@@ -259,28 +280,43 @@ class WalkForwardRunner:
         # sans les conditionner : une victoire adossee a une dispersion nulle ne dit
         # rien de SAC, mais c'est au lecteur du tableau d'en juger.
         multiplier = self.decisions_.groupby(["fold", "seed"])["multiplier"]
+        opponents = self._opponents()
         table = pd.DataFrame(
             {
                 "SAC": sharpe[seed_columns].mean(axis=1),
-                "Baseline": sharpe["Baseline"],
-                "Buy_and_hold": sharpe["Buy_and_hold"],
+                **{name: sharpe[name] for name in opponents},
                 "A_moyen": multiplier.mean().groupby("fold").mean(),
                 "A_dispersion": multiplier.std().groupby("fold").mean(),
             }
         )
-        table["SAC > Baseline"] = table["SAC"] > table["Baseline"]
-        table["SAC > Buy_and_hold"] = table["SAC"] > table["Buy_and_hold"]
+        for name in opponents:
+            table[f"SAC > {name}"] = table["SAC"] > table[name]
         return table
 
+    @staticmethod
+    def _indexed(stats: pd.DataFrame, fold: int):
+        """Pose les cles fold/strategy attendues par les tableaux par fold."""
+        stats = stats.copy()
+        stats["fold"] = fold
+        stats["strategy"] = stats.index
+        return stats.set_index(["fold", "strategy"])
+
     def _stats(self, returns: pd.DataFrame):
-        """Calcule les indicateurs financiers pour chaque colonne."""
+        """Calcule les indicateurs financiers pour chaque colonne.
+
+        Trois des quatre colonnes sont reprises telles quelles du tableau du
+        papier, pour qu'un Sharpe ne puisse pas differer d'un tableau a l'autre.
+        Seule annual_return reste propre a ce projet : elle compose, la ou E(R)
+        du papier annualise arithmetiquement.
+        """
+        paper = self._paper.table(returns)
         equity = (1.0 + returns).cumprod()
-        volatility = returns.std()
         return pd.DataFrame(
             {
                 "annual_return": equity.iloc[-1] ** (252 / len(returns)) - 1.0,
-                "annual_volatility": volatility * np.sqrt(252),
-                "sharpe_0pct": returns.mean() / volatility * np.sqrt(252),
-                "max_drawdown": (equity / equity.cummax() - 1.0).min(),
+                "annual_volatility": paper["Std(R)"],
+                "sharpe_0pct": paper["Sharpe"],
+                # Signe negatif conserve : convention des tableaux deja publies.
+                "max_drawdown": -paper["MDD"],
             }
         )
